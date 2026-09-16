@@ -4,7 +4,7 @@ hostname.if-ish (openbsd) style network configuration for linux in <400sloc of P
 
 this exists to have clean, concise, organized, and readable network configuration and was created for my distro, Basix Linux
 
-all private information in config files such as PSKs or wireguard keys does not leak to `ps`, and each config files permissions are kept at 600
+all private information in config files such as PSKs or wireguard keys do not leak to `ps`, and each config files permissions are kept at 600
 
 despite this being a shell script, config files are parsed as opposed to sourced/executed
 
