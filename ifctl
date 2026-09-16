@@ -1,0 +1,459 @@
+#!/bin/sh
+#
+# ifctl - hostname.if-style network interface config for linux
+#
+# usage: ifctl up   [interface ...]   (default: all of /etc/ifctl/interface.*)
+#        ifctl down [interface ...]
+#        ifctl show [interface ...]
+#        ifctl -n up eth0             (dry run: print commands, run nothing)
+#
+# config lives in /etc/ifctl/interface.<name>, one file per interface
+
+set -u
+
+CONFDIR=${CONFDIR:-/etc/ifctl}
+RUNDIR=${RUNDIR:-/run/ifctl}
+DRYRUN=false
+SEEN=
+
+warn() { printf 'ifctl: %s\n' "$*" >&2; }
+die() { warn "$*"; exit 1; }
+
+# execute a command or just print it with -n
+run() {
+    if $DRYRUN; then
+        printf '+ %s\n' "$*"
+    else
+        "$@" </dev/null || warn "failed: $*"
+    fi
+}
+
+# same but for a !-escaped line that needs a shell
+runsh() {
+    if $DRYRUN; then
+        printf '+ sh -c %s\n' "$1"
+    else
+        ( eval "$1" ) </dev/null || warn "failed: $1"
+    fi
+}
+
+conffile() { printf '%s\n' "$CONFDIR/interface.$1"; }
+
+# guard against a requires loop
+mark() {
+    case " $SEEN " in
+        *" $1 "*) return 1 ;;
+    esac
+    SEEN="$SEEN $1"
+    return 0
+}
+
+# dhcp
+#
+# pick a client once at runtime, dhcpcd does v4 and v6 in one process
+# and manages its own pidfile, udhcpc needs to be told where to put one
+dhcp_up() {
+    _if=$1
+    if command -v dhcpcd >/dev/null 2>&1; then
+        run dhcpcd -q -w "$_if"
+    elif command -v udhcpc >/dev/null 2>&1; then
+        run udhcpc -i "$_if" -p "$RUNDIR/udhcpc.$_if.pid" \
+            -s /usr/share/udhcpc/default.script -b -t 5
+    else
+        warn "$_if: no dhcp client found"
+    fi
+}
+
+dhcp_down() {
+    _if=$1
+    _pid=$RUNDIR/udhcpc.$_if.pid
+    if [ -f "$_pid" ]; then
+        run kill "$(cat "$_pid")"
+        $DRYRUN || rm -f "$_pid"
+    fi
+    command -v dhcpcd >/dev/null 2>&1 && run dhcpcd -k "$_if"
+    return 0
+}
+
+# wireguard
+#
+# wg wants keys as file paths rather than args so they don't appear in argv
+# where ps can read them (reasonably so)
+#
+# /dev/stdin keeps that property, keys are never put into a command line
+wg_stdin() {
+    _key=$1
+    shift
+    if $DRYRUN; then
+        printf '+ wg %s <key on stdin, not shown>\n' "$*"
+    else
+        printf '%s\n' "$_key" | wg "$@" || warn "failed: wg $*"
+    fi
+}
+
+# wgpeer <pubkey> [wgendpoint host port] [wgaip cidr]... [wgpka n] [wgpsk key]
+wg_peer() {
+    _wif=$1
+    shift
+    [ $# -gt 0 ] || { warn "$_wif: wgpeer needs a public key"; return 0; }
+    _pub=$1
+    shift
+
+    _pargs=
+    _aips=
+    _psk=
+    while [ $# -gt 0 ]; do
+        case $1 in
+        wgendpoint)
+            [ $# -ge 3 ] || { warn "$_wif: wgendpoint needs host and port"; return 0; }
+            case $2 in
+                *:*) _pargs="$_pargs endpoint [$2]:$3" ;; # v6 literal
+                *) _pargs="$_pargs endpoint $2:$3" ;;
+            esac
+            shift 3
+            ;;
+        wgaip)
+            [ $# -ge 2 ] || { warn "$_wif: wgaip needs a prefix"; return 0; }
+            _aips="${_aips:+$_aips,}$2" # wg wants one comma list
+            shift 2
+            ;;
+        wgpka)
+            _pargs="$_pargs persistent-keepalive $2"
+            shift 2
+            ;;
+        wgpsk)
+            _psk=$2
+            shift 2
+            ;;
+        wgdescr)
+            shift 2 ;; # no equivalent on linux
+        *)
+            warn "$_wif: unknown wgpeer option '$1'"
+            shift
+            ;;
+        esac
+    done
+
+    # unquoted on purpose, inside set -f and these are keys and CIDRs
+    if [ -n "$_psk" ]; then
+        wg_stdin "$_psk" set "$_wif" peer "$_pub" preshared-key /dev/stdin \
+            $_pargs ${_aips:+allowed-ips $_aips}
+    else
+        run wg set "$_wif" peer "$_pub" $_pargs ${_aips:+allowed-ips $_aips}
+    fi
+}
+
+# wireless configuration
+#
+# openbsd handles this pretty differently, it keeps the join list in net80211
+# linux keeps the supplicant in userspace, so we're generating a wpa_supplicant
+# config here, RUNDIR is tmpfs which is where a file full of PSKs belongs
+wifi_start() {
+    _wif=$1
+    _wfile=$2
+    _conf=$RUNDIR/wpa_supplicant.$_wif.conf
+    _wpid=$RUNDIR/wpa_supplicant.$_wif.pid
+
+    # join <ssid> [wpakey <passphrase], same as hostname.if
+    # two -e rather than \| because that isn't POSIX BRE
+    _joins=$(sed -n \
+        -e 's/^[     ]*join[     ]\{1,\}//p' \
+        -e 's/^[     ]*nwid[     ]\{1,\}//p' "$_wfile")
+    [ -n "$_joins" ] || return 0
+
+    if $DRYRUN; then
+        printf '+ generate %s\n' "$_conf"
+        printf '%s\n' "$_joins" | while read -r _ssid _k1 _k2; do
+            printf '+   network: %s %s\n' "$_ssid" "${_k1:+($_k1 ...)}"
+        done
+        printf '+ wpa_supplicant -B -i %s -c %s -P %s\n' "$_wif" "$_conf" "$_wpid"
+        return 0
+    fi
+
+    if ! command -v wpa_supplicant >/dev/null 2>&1; then
+        warn "$_wif: wpa_supplicant not found"
+        return 0
+    fi
+
+    _old=$(umask)
+    umask 077
+    : > "$_conf"
+    printf 'ctrl_interface=%s\n' "$RUNDIR/wpa_ctrl" >> "$_conf"
+    # earlier lines win same as openbsd join list
+    _prio=$(printf '%s\n' "$_joins" | wc -l)
+    printf '%s\n' "$_joins" | while read -r _ssid _kw _key; do
+        {
+            printf 'network={\n'
+            printf '    ssid="%s"\n' "$_ssid"
+            printf '    scan_ssid=1\n' # also finds hidden networks
+            case $_kw in
+            wpakey)
+                # hash the passphrase so plaintext stays out of RUNDIR
+                # wpa_passphrase echoes it back as plaintext, drop it
+                if command -v wpa_passphrase >/dev/null 2>&1; then
+                    wpa_passphrase "$_ssid" "$_key" |
+                        sed -n 's/^[     ]*psk=\([0-9a-f]\{64\}\)$/    psk=\1/p'
+                else
+                    printf '    psk="%s"\n' "$_key"
+                fi
+                ;;
+            '') printf '    key_mgmt=NONE\n' ;;
+            *) warn "$_wif: unknown join option '$_kw'" ;;
+            esac
+            printf '    priority=%s\n' "$_prio"
+            printf '}\n'
+        } >> "$_conf"
+        _prio=$((_prio - 1))
+    done
+    umask "$_old"
+
+    run wpa_supplicant -B -i "$_wif" -c "$_conf" -P "$_wpid"
+}
+
+wifi_stop() {
+    _wif=$1
+    _wpid=$RUNDIR/wpa_supplicant.$_wif.pid
+    if [ -f "$_wpid" ]; then
+        run kill "$(cat "$_wpid")"
+        $DRYRUN || rm -f "$_wpid" "$RUNDIR/wpa_supplicant.$_wif.conf"
+    fi
+    return 0
+}
+
+# parsing
+
+# read one config line already word-split into "$@" and act on it
+# $if is inscope
+do_line() {
+    [ $# -gt 0 ] || return 0
+    _kw=$1
+    shift
+
+    case $_kw in
+    '#'*)
+        ;;
+    create)
+        # create <type> [type args...] -> ip link add wg0 type wireguard
+        [ $# -gt 0 ] || { warn "$if: create needs a type"; return 0; }
+        run ip link add "$if" type "$@"
+        ;;
+    inet)
+        case ${1:-} in
+        autoconf|dhcp)
+            dhcp_up "$if"
+            ;;
+        *)
+            run ip addr add "$@" dev "$if"
+            ;;
+        esac
+        ;;
+    inet6)
+        case ${1:-} in
+        autoconf)
+            run sysctl -qw "net.ipv6.conf.$if.accept_ra=1"
+            ;;
+        *)
+            run ip -6 addr add "$@" dev "$if"
+            ;;
+        esac
+        ;;
+    dhcp)
+        dhcp_up "$if"
+        ;;
+    wgkey)
+        wg_stdin "$1" set "$if" private-key /dev/stdin
+        ;;
+    wgport)
+        run wg set "$if" listen-port "$1"
+        ;;
+    wgrtable)
+        # openbsd routes wg traffic via an rtable, linux uses fwmark + ip
+        run wg set "$if" fwmark "$1"
+        ;;
+    wgpeer)
+        wg_peer "$if" "$@"
+        ;;
+    -wgpeer)
+        run wg set "$if" peer "$1" remove
+        ;;
+    -wgpeers)
+        runsh "wg set $if \$(wg show $if peers | sed 's/^/peer /;s/\$/ remove/')"
+        ;;
+    gateway)
+        run ip route add default via "$@" dev "$if"
+        ;;
+    route)
+        run ip route add "$@" dev "$if"
+        ;;
+    mtu|txqueuelen|master|address|group)
+        run ip link set "$if" "$_kw" "$@"
+        ;;
+    lladdr)
+        run ip link set "$if" address "$@"
+        ;;
+    up|down)
+        run ip link set "$if" "$_kw"
+        ;;
+    requires)
+        ;; # already resolved before the parse loop
+    *)
+        warn "$if: unknown keyword '$_kw'"
+        ;;
+    esac
+}
+
+# up/down
+ifup() {
+    spec=$1 # either "wg0" or "wg0@airvpn-chicago"
+    if=${spec%@*} # the actual kernel interface name
+    mark "$spec" || return 0
+    _file=$(conffile "$spec")
+    [ -f "$_file" ] || { warn "$_file: no such file"; return 1; }
+
+    # this file probably holds private keys, -L so a symlinked profile is
+    # checked on its target instead of the link
+    if ! $DRYRUN; then
+        case $(ls -ldL "$_file" | cut -c1-10) in
+            -rw-------|-r--------) ;;
+            *) warn "$_file: insecure permissions, fixing"
+               chmod 600 "$_file" ;;
+        esac
+    fi
+
+    # profiles are mutually exclusive, only one can own the interface name
+    # and ip link add would fail anyway
+    if [ "$spec" != "$if" ] && ip link show "$if" >/dev/null 2>&1; then
+        ifdown "$if"
+    fi
+
+    # resolve dependencies first, recursing mid-parse would clobber
+    # $if and fd3 since posix sh has no locals (it has unset but shut)
+    for _dep in $(sed -n 's/^[     ]*requires[     ]\{1,\}//p' "$_file"); do
+        ifup "$_dep"
+    done
+    spec=$1
+    if=${spec%@*}
+    _file=$(conffile "$spec")
+
+    set -f # no globbing while we word-split config lines
+
+    # create the link
+    _create=$(sed -n 's/^[     ]*create[     ]\{1,\}//p' "$_file")
+    [ -n "$_create" ] && run ip link add "$if" type $_create
+
+    # up the link unless told otherwise
+    # hostname.if does this implicitly
+    grep -q '^[     ]*down[     ]*$' "$_file" || run ip link set "$if" up
+
+    # associate before DHCP lease request
+    wifi_start "$if" "$_file"
+
+    # everything else in file order
+    exec 3< "$_file" # fd 3 so commands cant eat our input
+    _acc=
+    while IFS='     ' read -r _line <&3; do
+        # backslash continuation, wgpeer lines get kinda long
+        case $_line in
+            *\\) _acc="$_acc${_line%\\} "; continue ;;
+        esac
+        _line=$_acc$_line
+        _acc=
+
+        case $_line in
+        '-!'*) ;; # down hook, runs in ifdown
+        '!'*) runsh "${_line#?}" ;;
+        ''|'#'*) ;;
+        up|down|create*|requires*|join*|nwid*) ;; # handled above
+        *) do_line $_line ;; # deliberately unquoted
+        esac
+    done
+    exec 3<&-
+    set +f
+
+    # remember which profile owns the interface so ifdown can find its config
+    $DRYRUN || printf '%s\n' "$spec" > "$RUNDIR/$if.profile"
+}
+
+ifdown() {
+    spec=$1
+    if=${spec%@*}
+
+    # bare name given, look up whatever profile is currently up
+    if [ "$spec" = "$if" ] && [ -f "$RUNDIR/$if.profile" ]; then
+        spec=$(cat "$RUNDIR/$if.profile")
+    fi
+    _file=$(conffile "$spec")
+
+    # down hooks first while the interface still exists
+    if [ -f "$_file" ]; then
+        set -f
+        exec 3< "$_file"
+        _acc=
+        while IFS='     ' read -r _line <&3; do
+            case $_line in
+                *\\) _acc="$_acc${_line%\\} "; continue ;;
+            esac
+            _line=$_acc$_line
+            _acc=
+            case $_line in
+                '-!'*) runsh "${_line#-!}" ;;
+            esac
+        done
+        exec 3<&-
+        set +f
+    fi
+
+    wifi_stop "$if"
+    dhcp_down "$if"
+    run ip addr flush dev "$if"
+    run ip link set "$if" down
+    # only destroy links we created
+    if [ -f "$_file" ] && grep -q '^[     ]*create[     ]' "$_file"; then
+        run ip link del "$if"
+    fi
+    $DRYRUN || rm -f "$RUNDIR/$if.profile"
+}
+
+ifshow() {
+    if=${1%@*}
+    [ -f "$RUNDIR/$if.profile" ] &&
+        printf '%s: profile %s\n' "$if" "$(cat "$RUNDIR/$if.profile")"
+    run ip -br addr show dev "$if"
+}
+
+# bare configs only, never profiles
+all_ifaces() {
+    for _f in "$CONFDIR"/interface.*; do
+        [ -f "$_f" ] || continue
+        case $_f in *@*) continue ;; esac
+        printf '%s\n' "${_f##*/interface.}"
+    done
+}
+
+# main
+
+[ $# -gt 0 ] || die "usage: ifctl [-n] up|down|show [interface ...]"
+
+case $1 in
+    -n) DRYRUN=true; shift ;;
+esac
+
+[ $# -gt 0 ] || die "usage: ifctl [-n] up|down|show [interface ...]"
+action=$1
+shift
+
+$DRYRUN || mkdir -p "$RUNDIR"
+
+if [ $# -eq 0 ]; then
+    # loopback first, dependencies sort themselves out via requires
+    set -- $(all_ifaces | grep -x lo) $(all_ifaces | grep -vx lo | sort)
+fi
+
+for iface; do
+    case $action in
+        up) ifup "$iface" ;;
+        down) ifdown "$iface" ;;
+        show) ifshow "$iface" ;;
+        *) die "unknown action: $action" ;;
+    esac
+done
