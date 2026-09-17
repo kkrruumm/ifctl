@@ -15,6 +15,8 @@ CONFDIR=${CONFDIR:-/etc/ifctl}
 RUNDIR=${RUNDIR:-/run/ifctl}
 DRYRUN=false
 SEEN=
+RTABLE=
+RTBROKEN=
 
 warn() { printf 'ifctl: %s\n' "$*" >&2; }
 die() { warn "$*"; exit 1; }
@@ -143,6 +145,195 @@ wg_peer() {
     fi
 }
 
+# busyboxs ip caps table ids at 1023 (RT_TABLE_MAX in rt_names.c) and tables
+# above 255 need RTA_TABLE so stay underneath both of those, 51820
+# may not be usable (if you're using iproute2 this doesnt matter)
+wg_freetable() {
+    _t=1
+    while [ "$_t" -lt 252 ]; do
+        if [ -z "$(ip -4 route show table "$_t" 2>/dev/null)" ] &&
+           [ -z "$(ip -6 route show table "$_t" 2>/dev/null)" ]; then
+            printf '%s\n' "$_t"
+            return 0
+        fi
+        _t=$((_t + 1))
+    done
+    warn "no free routing table below 252"
+    return 1
+}
+
+# with strict (2) rp_filter the kernel revalidates all inbound packets
+# by looking up its source as a destination
+#
+# inbound packets don't carry a fwmark so that lookup hits the tunnel table,
+# resolves the peer endpoint to dev $if, doesn't match the interface the packet
+# actually arrived on, and the handshake reply is thus dropped
+#
+# src_valid_mark makes the lookup honor skb->mark, something else has to
+# put the mark there, so conntrack remembers the mark on the flow
+# on the way out and restores it on the way back in
+#
+# prerouting mangle is hook prio -150 and the routing decision comes after
+# the hook chain so the mark is back on the packet before rp_filter sees it
+#
+# why is it that i keep thinking "oh that would be easy to make" with these projects
+#
+# this is wg-quicks add_default minus its anti-spoofing preraw drop
+wg_mangle_up() {
+    _mif=$1
+    _mtbl=$2
+    _fw=none
+
+    if command -v nft >/dev/null 2>&1; then
+        _fw=nft
+        for _f in ip ip6; do
+            run nft add table $_f "ifctl-$_mif"
+            run nft add chain $_f "ifctl-$_mif" premangle \
+                "{ type filter hook prerouting priority -150; }"
+            run nft add chain $_f "ifctl-$_mif" postmangle \
+                "{ type filter hook postrouting priority -150; }"
+            run nft add rule $_f "ifctl-$_mif" postmangle \
+                meta l4proto udp mark "$_mtbl" ct mark set mark
+            run nft add rule $_f "ifctl-$_mif" premangle \
+                meta l4proto udp meta mark set ct mark
+        done
+    elif command -v iptables >/dev/null 2>&1; then
+        _fw=iptables
+        for _c in iptables ip6tables; do
+            command -v $_c >/dev/null 2>&1 || continue
+            run $_c -t mangle -I POSTROUTING -p udp -m mark --mark "$_mtbl" \
+                -j CONNMARK --save-mark
+            run $_c -t mangle -I PREROUTING -p udp -j CONNMARK --restore-mark
+        done
+    else
+        # rp_filter set to 2 will drop replies if you don't have nft or iptables
+        # this is just a warning, i don't really want to fuck with settings like
+        # this automatically
+        if [ "$($DRYRUN || sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)" = 1 ]; then
+            warn "$_mif: no nft or iptables and rp_filter is strict, replies"
+            warn "$_mif: will be dropped. set net.ipv4.conf.all.rp_filter=2"
+        fi
+    fi
+
+    $DRYRUN || printf '%s\n' "$_fw" > "$RUNDIR/$_mif.fw"
+}
+
+wg_mangle_down() {
+    _mif=$1
+    _mtbl=$2
+    _ff=$RUNDIR/$_mif.fw
+    [ -f "$_ff" ] || return 0
+    case $(cat "$_ff") in
+    nft)
+        for _f in ip ip6; do
+            run nft delete table $_f "ifctl-$_mif"
+        done
+        ;;
+    iptables)
+        for _c in iptables ip6tables; do
+            command -v $_c >/dev/null 2>&1 || continue
+            run $_c -t mangle -D PREROUTING -p udp -j CONNMARK --restore-mark
+            run $_c -t mangle -D POSTROUTING -p udp -m mark --mark "$_mtbl" \
+                -j CONNMARK --save-mark
+        done
+        ;;
+    esac
+    $DRYRUN || rm -f "$_ff"
+    return 0
+}
+
+# wgtable <n>|auto
+#
+# a default route out of a tunnel also matches the tunnels own
+# encrypted route to the peer endpoint which is obviously a routing loop
+#
+# pinning a host route to the endpoint works until the gateway changes, so
+# instead just let wg mark the packets it sends itself and sort on the mark
+#
+#  pri+0  table main suppress_prefixlength 0
+#         specific routes in main still win, lan and link local aren't
+#         tunneled, only mains default is ignored
+#
+#  pri+1  fwmark N table main
+#         wgs own traffic keeps using the real default route, whatever
+#         it happens to be at the time
+#
+#  pri+2 table N
+#        everything else goes through the tunnel
+#
+# wg-quick writes the middle two as a single inverted rule, "not fwmark N table N"
+# busybox `ip` doesn't have a "not" keyword, splitting it is equivalent and
+# works on both iproute2 and busybox ip
+#
+# subsequent route/gateway lines for this interface go in table N
+wg_table_up() {
+    _tif=$1
+    _tbl=${2:-auto}
+
+    # ip rule and "ip route ... table" are one busybox config option,
+    # CONFIG_FEATURE_IP_RULE, and it may or may not be turned off
+    if ! $DRYRUN && ! ip rule list >/dev/null 2>&1; then
+        warn "$_tif: this ip has no policy routing, a default route through"
+        warn "$_tif: the tunnel would loop. busybox needs FEATURE_IP_RULE"
+        RTBROKEN=1
+        return 0
+    fi
+
+    [ "$_tbl" = auto ] && { _tbl=$(wg_freetable) || { RTBROKEN=1; return 0; }; }
+    case $_tbl in
+        ''|*[!0-9]*)
+            warn "$_tif: wgtable wants a table number or auto"
+            RTBROKEN=1
+            return 0 ;;
+    esac
+    [ "$_tbl" -le 1023 ] && [ "$_tbl" -ge 1 ] ||
+        warn "$_tif: table $_tbl is out of range for busybox ip (1-1023)"
+
+    # explicit priority, busybox doesnt hand out descending ones the way
+    # iproute2 does so relative order cant be left to insertion order
+    # and deleting by prio later is unambiguous
+    _pri=$((32000 + 3 * (_tbl % 256)))
+
+    run wg set "$_tif" fwmark "$_tbl"
+
+    # rp_filter does the reverse path lookup without the fwmark so
+    # it resolves replies arriving on the physical interface against the
+    # tunnel table and drops them, this makes the lookup honor the mark
+    run sysctl -qw net.ipv4.conf.all.src_valid_mark=1
+    wg_mangle_up "$_tif" "$_tbl"
+
+    for _p in -4 -6; do
+        run ip $_p rule add priority "$_pri" table main suppress_prefixlength 0
+        run ip $_p rule add priority "$((_pri + 1))" fwmark "$_tbl" table main
+        run ip $_p rule add priority "$((_pri + 2))" table "$_tbl"
+    done
+
+    RTABLE=$_tbl
+    $DRYRUN || printf '%s\n' "$_tbl" > "$RUNDIR/$_tif.table"
+}
+
+# rules outlive the link unlike the routes in the table so they have to
+# go explicitly
+#
+# this reads the table back from RUNDIR instead of the config so an edited config
+# cant fuck this up
+wg_table_down() {
+    _tif=$1
+    _tf=$RUNDIR/$_tif.table
+    [ -f "$_tf" ] || return 0
+    _tbl=$(cat "$_tf")
+    _pri=$((32000 + 3 * (_tbl % 256)))
+    wg_mangle_down "$_tif" "$_tbl"
+    for _p in -4 -6; do
+        run ip $_p rule del priority "$((_pri + 2))"
+        run ip $_p rule del priority "$((_pri + 1))"
+        run ip $_p rule del priority "$_pri"
+        run ip $_p route flush table "$_tbl"
+    done
+    $DRYRUN || rm -f "$_tf"
+    return 0
+}
+
 # wireless configuration
 #
 # openbsd handles this pretty differently, it keeps the join list in net80211
@@ -222,6 +413,17 @@ wifi_stop() {
 
 # parsing
 
+# a default route that was meant for a wgtable table shouldnt fall back into main
+rt_default() {
+    [ -n "$RTBROKEN" ] || return 1
+    case ${1:-} in
+        default|0.0.0.0/0|::/0|0/0)
+            warn "$if: refusing '$*', no policy routing to put it behind"
+            return 0 ;;
+    esac
+    return 1
+}
+
 # read one config line already word-split into "$@" and act on it
 # $if is inscope
 do_line() {
@@ -270,6 +472,9 @@ do_line() {
         # openbsd routes wg traffic via an rtable, linux uses fwmark + ip
         run wg set "$if" fwmark "$1"
         ;;
+    wgtable)
+        wg_table_up "$if" "${1:-auto}"
+        ;;
     wgpeer)
         wg_peer "$if" "$@"
         ;;
@@ -280,10 +485,17 @@ do_line() {
         runsh "wg set $if \$(wg show $if peers | sed 's/^/peer /;s/\$/ remove/')"
         ;;
     gateway)
-        run ip route add default via "$@" dev "$if"
+        rt_default "$@" && return 0
+        run ip route add default via "$@" ${RTABLE:+table $RTABLE} dev "$if"
         ;;
     route)
-        run ip route add "$@" dev "$if"
+        # an explicit table in the line wins over the one wgtable set
+        _rt=$RTABLE
+        case " $* " in
+            *" table "*) _rt= ;;
+            *) rt_default "$@" && return 0 ;;
+        esac
+        run ip route add "$@" ${_rt:+table $_rt} dev "$if"
         ;;
     mtu|txqueuelen|master|address|group)
         run ip link set "$if" "$_kw" "$@"
@@ -336,6 +548,8 @@ ifup() {
     _file=$(conffile "$spec")
 
     set -f # no globbing while we word-split config lines
+    RTABLE= # set by wgtable, scoped to this file
+    RTBROKEN=
 
     # create the link
     _create=$(sed -n 's/^[     ]*create[     ]\{1,\}//p' "$_file")
@@ -405,6 +619,7 @@ ifdown() {
 
     wifi_stop "$if"
     dhcp_down "$if"
+    wg_table_down "$if"
     run ip addr flush dev "$if"
     run ip link set "$if" down
     # only destroy links we created
